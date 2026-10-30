@@ -1,6 +1,6 @@
 ;;; arxiv-citation.el --- Utility functions for dealing with arXiv papers -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2022–2023  Tony Zorman
+;; Copyright (C) 2022–2023, 2026  Tony Zorman
 ;;
 ;; Author: Tony Zorman <soliditsallgood@mailbox.org>
 ;; Keywords: convenience
@@ -69,6 +69,7 @@
 (require 'bibtex)
 (require 'dash)
 (require 's)
+(require 'url-http)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Custom Variables
@@ -204,7 +205,7 @@ Returns an alist with keys `id', `authors', `title', `year', and
                            (--map (s-split " " it))
                            (--map (apply #'concat (-last-item it) ", " (-butlast it)))))
              (year (seq-take (cadr (alist-get 'published entry)) 4))
-             (categories (--keep (alist-get 'term (cadr it)) entry)))
+             (categories (-uniq (--keep (alist-get 'term (cadr it)) entry))))
         (unless (string= title "Error")
           `((id . ,arXiv-id)
             (authors . ,authors)
@@ -214,6 +215,25 @@ Returns an alist with keys `id', `authors', `title', `year', and
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Citations
+
+(defvar url-http-response-status) ; forward decl
+
+(defun arxiv-citation--zbmath (url)
+  "Return the body of URL using curl."
+  (let ((buffer (url-retrieve-synchronously url t t 30)))
+    (unless buffer (error "Could not retrieve %s" url))
+    (unwind-protect
+        (with-current-buffer buffer
+          (if-let ((curl (and (eq url-http-response-status 403)
+                              (executable-find "curl"))))
+              (progn (erase-buffer)
+                     (call-process curl nil t nil "--disable" "--fail" "--location"
+                                   "--silent" "--show-error" "--max-time" "30" "--" url))
+            (goto-char (point-min))
+            (re-search-forward "\r?\n\r?\n")
+            (delete-region (point-min) (point)))
+          (buffer-string))
+      (kill-buffer buffer))))
 
 (defun arxiv-citation-get-citation (url)
   "Return the citation corresponding to URL.
@@ -227,7 +247,8 @@ data if applicable (i.e., an arXiv url)."
                          (arxiv-citation-arXiv-id (arxiv-citation-pdf-link url))))
                 ((s-prefix? zbmath url)
                  url))))
-    (with-current-buffer (url-retrieve-synchronously zbmath-url t t)
+    (with-temp-buffer
+      (insert (arxiv-citation--zbmath zbmath-url))
       (let* ((html (arxiv-citation-parse :html))
              (id (cadr (s-match "Document Zbl \\([0-9.]*\\)"
                                 ;; Hahahahahahahahaha
@@ -238,23 +259,17 @@ data if applicable (i.e., an arXiv url)."
 
 (defun arxiv-citation-get-zbmath-citation (url)
   "Obtain a zbmath citation from URL."
-  (with-current-buffer (url-retrieve-synchronously url t t)
-    (goto-char 0)
-    (search-forward "\n\n")             ; skip header
-    ;; Format citation
-    (let ((citation (buffer-substring (point) (point-max))))
-      (erase-buffer)
-      (insert citation)
-      ;; Insert readable name
-      (goto-char 0)
-      (search-forward "{")
-      (zap-up-to-char 1 ?,)                      ; @Article{,
-      (insert (arxiv-citation-generate-autokey)) ; @Article{name,
-      ;; Align
-      (setq-local indent-tabs-mode      nil
-                  align-default-spacing 5)
-      (align-regexp (point-min) (point-max) "\\(\\s-*\\) =")
-      (buffer-string))))
+  (with-temp-buffer
+    (insert (arxiv-citation--zbmath url))
+    (goto-char (point-min))
+    (search-forward "{")
+    (zap-up-to-char 1 ?,)                      ; @Article{,
+    (insert (arxiv-citation-generate-autokey)) ; @Article{name,
+    ;; Align
+    (setq-local indent-tabs-mode      nil
+                align-default-spacing 5)
+    (align-regexp (point-min) (point-max) "\\(\\s-*\\) =")
+    (buffer-string)))
 
 (defun arxiv-citation-get-arxiv-citation (url)
   "Extract an arXiv citation from URL."
